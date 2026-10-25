@@ -1,5 +1,6 @@
 use core::fmt::Debug;
 use std::collections::HashMap;
+use std::io::Read;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ use starknet_api::deprecated_contract_class::{EntryPointOffset, EntryPointV0};
 use starknet_rs_core::types::contract::{SierraClass, SierraClassDebugInfo};
 use starknet_rs_core::types::{
     ContractClass as CodegenContractClass, FlattenedSierraClass as CodegenSierraContractClass,
-    LegacyContractEntryPoint,
+    LegacyContractEntryPoint, LegacyEntryPointsByType,
 };
 use starknet_types_core::felt::Felt;
 
@@ -241,44 +242,35 @@ impl TryFrom<Cairo0ContractClass> for RunnableCompiledClass {
                     Error::ConversionError(ConversionError::InvalidInternalStructure(e.to_string()))
                 })?;
 
-                fn convert_to_entrypoints_v0<'a, I>(entry_points: I) -> Vec<EntryPointV0>
-                where
-                    I: Iterator<Item = &'a LegacyContractEntryPoint>,
-                {
-                    entry_points
-                        .map(|entry_point| EntryPointV0 {
-                            selector: starknet_api::core::EntryPointSelector(entry_point.selector),
-                            offset: EntryPointOffset(entry_point.offset as usize),
-                        })
-                        .collect()
-                }
-
-                let mut entry_points_by_type = HashMap::new();
-                entry_points_by_type.insert(
-                    EntryPointType::Constructor,
-                    convert_to_entrypoints_v0(
-                        deprecated_contract_class.entry_points_by_type.constructor.iter(),
+                CompiledClassV0(Arc::new(CompiledClassV0Inner {
+                    program,
+                    entry_points_by_type: convert_to_entry_points_v0(
+                        &deprecated_contract_class.entry_points_by_type,
                     ),
-                );
-
-                entry_points_by_type.insert(
-                    EntryPointType::External,
-                    convert_to_entrypoints_v0(
-                        deprecated_contract_class.entry_points_by_type.external.iter(),
-                    ),
-                );
-
-                entry_points_by_type.insert(
-                    EntryPointType::L1Handler,
-                    convert_to_entrypoints_v0(
-                        deprecated_contract_class.entry_points_by_type.l1_handler.iter(),
-                    ),
-                );
-
-                CompiledClassV0(Arc::new(CompiledClassV0Inner { program, entry_points_by_type }))
+                }))
             }
         }))
     }
+}
+
+fn convert_to_entry_points_v0(
+    entry_points_by_type: &LegacyEntryPointsByType,
+) -> HashMap<EntryPointType, Vec<EntryPointV0>> {
+    let convert = |entry_points: &[LegacyContractEntryPoint]| {
+        entry_points
+            .iter()
+            .map(|entry_point| EntryPointV0 {
+                selector: starknet_api::core::EntryPointSelector(entry_point.selector),
+                offset: EntryPointOffset(entry_point.offset as usize),
+            })
+            .collect()
+    };
+
+    HashMap::from([
+        (EntryPointType::Constructor, convert(&entry_points_by_type.constructor)),
+        (EntryPointType::External, convert(&entry_points_by_type.external)),
+        (EntryPointType::L1Handler, convert(&entry_points_by_type.l1_handler)),
+    ])
 }
 
 fn convert_sierra_to_codegen(
@@ -328,20 +320,27 @@ pub fn convert_codegen_to_blockifier_compiled_class(
             jsonified_sierra_to_runnable_casm(json_value, &sierra.contract_class_version)?
         }
         CodegenContractClass::Legacy(legacy) => {
-            // In RPC responses the legacy program is gzip-compressed (and base64-encoded when
-            // serialized), but starknet_api expects it as a decompressed JSON object.
-            let program: serde_json::Value =
-                serde_json::from_reader(GzDecoder::new(legacy.program.as_slice()))
-                    .map_err(JsonError::SerdeJsonError)?;
-            let mut class_json = serde_json::to_value(&class).map_err(JsonError::SerdeJsonError)?;
-            class_json["program"] = program;
-            let class: starknet_api::deprecated_contract_class::ContractClass =
-                serde_json::from_value(class_json)
-                    .map_err(|e| Error::JsonError(JsonError::SerdeJsonError(e)))?;
-            let compiled = class.try_into().map_err(|e: ProgramError| {
-                Error::ConversionError(ConversionError::InvalidInternalStructure(e.to_string()))
-            })?;
-            RunnableCompiledClass::V0(compiled)
+            // In RPC responses the legacy program is gzip-compressed
+            let mut program_json = Vec::new();
+            GzDecoder::new(legacy.program.as_slice()).read_to_end(&mut program_json).map_err(
+                |e| {
+                    Error::ConversionError(ConversionError::InvalidInternalStructure(format!(
+                        "program: unable to decompress: {e}"
+                    )))
+                },
+            )?;
+            let program =
+                deserialize_program(&mut serde_json::Deserializer::from_slice(&program_json))
+                    .map_err(|e| {
+                        Error::ConversionError(ConversionError::InvalidInternalStructure(
+                            e.to_string(),
+                        ))
+                    })?;
+
+            RunnableCompiledClass::V0(CompiledClassV0(Arc::new(CompiledClassV0Inner {
+                program,
+                entry_points_by_type: convert_to_entry_points_v0(&legacy.entry_points_by_type),
+            })))
         }
     })
 }
@@ -383,8 +382,10 @@ mod tests {
         ContractClassAbiEntryWithType, DeprecatedContractClass,
     };
     use crate::contract_class::{
-        ContractClass, convert_codegen_to_blockifier_compiled_class, convert_sierra_to_codegen,
+        Cairo0ContractClass, ContractClass, convert_codegen_to_blockifier_compiled_class,
+        convert_sierra_to_codegen,
     };
+    use crate::error::{ConversionError, Error};
     use crate::felt::felt_from_prefixed_hex;
     use crate::serde_helpers::rpc_sierra_contract_class_to_sierra_contract_class::deserialize_to_sierra_contract_class;
     use crate::traits::TryHashProducer;
@@ -430,7 +431,30 @@ mod tests {
         assert!(matches!(contract_class, CodegenContractClass::Legacy(_)));
 
         let compiled_class = convert_codegen_to_blockifier_compiled_class(contract_class).unwrap();
-        assert!(matches!(compiled_class, RunnableCompiledClass::V0(_)));
+
+        // must match the conversion of the same class loaded as devnet's own RPC class
+        let expected_class = RunnableCompiledClass::try_from(Cairo0ContractClass::Rpc(
+            DeprecatedContractClass::rpc_from_json_str(&contract_str).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(compiled_class, expected_class);
+    }
+
+    #[test]
+    fn rpc_cairo_0_class_with_invalid_compressed_program_not_converted() {
+        let contract_str = std::fs::read_to_string(CAIRO_0_RPC_CONTRACT_PATH).unwrap();
+        let mut contract_class: CodegenContractClass = serde_json::from_str(&contract_str).unwrap();
+        let CodegenContractClass::Legacy(legacy) = &mut contract_class else {
+            panic!("expected a legacy class");
+        };
+        legacy.program = b"not gzipped".to_vec();
+
+        match convert_codegen_to_blockifier_compiled_class(contract_class) {
+            Err(Error::ConversionError(ConversionError::InvalidInternalStructure(msg))) => {
+                assert!(msg.contains("unable to decompress"), "unexpected message: {msg}")
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]
